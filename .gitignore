@@ -1,0 +1,9 @@
+.venv/
+venv/
+env/
+virtualenv/
+
+__pycache__/
+*.pyc
+.Python
+pip-selfcheck.json
