@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Итеративный DNS-сервер на Python с использованием dnspython.
-
-Возможности:
-  * Итеративный опрос серверов, ответственных за зону (начиная с корневых
-    серверов, через TLD, далее по делегированию NS/glue-записям).
-  * Поддержка нескольких типов записей: A, AAAA, MX, NS, TXT, CNAME, SOA,
-    PTR, SRV и др. (любой тип, который понимает dnspython).
-  * Кэш ответов, который сохраняется на диск (JSON) и переживает
-    перезапуск сервера.
-  * Одновременная работа с несколькими клиентами (ThreadingMixIn, UDP и TCP).
-  * Интерактивное управление через терминал (команды cache/clear/save/exit).
-
-Зависимости:
-    pip install dnspython
-
-Запуск (обычно нужны права администратора/root для порта 53):
-    sudo python3 dns_server.py --port 53
-    (или без sudo на непривилегированном порту)
-    python3 dns_server.py --port 5353
-
-Проверка:
-    dig @127.0.0.1 -p 5353 example.com A
-    nslookup -port=5353 example.com 127.0.0.1
-"""
 
 import argparse
 import json
@@ -46,11 +21,6 @@ import dns.rdatatype
 import dns.rrset
 import dns.exception
 
-
-# --------------------------------------------------------------------------
-# Корневые DNS-серверы (root hints), используются как отправная точка
-# итеративного разрешения имён.
-# --------------------------------------------------------------------------
 ROOT_SERVERS = [
     "198.41.0.4",     # a.root-servers.net
     "199.9.14.201",   # b.root-servers.net
@@ -73,12 +43,9 @@ NEGATIVE_TTL = 300       # TTL для кэширования отрицател�
 
 CACHE_FILE = "dns_cache.json"
 cache_lock = threading.Lock()
-cache = {}  # ключ "qname|QTYPE" -> {"rrsets": [...], "rcode": int, "expire": ts}
+cache = {} 
 
-
-# ==========================================================================
-#  Кэш: загрузка / сохранение / сериализация
-# ==========================================================================
+#  Кэш: загрузка, сохранение, сериализация
 def load_cache():
     global cache
     if os.path.exists(CACHE_FILE):
@@ -129,7 +96,7 @@ def deserialize_rrset(d: dict, ttl: int):
 
 def store_cache(key: str, answer, rcode: int):
     if rcode not in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
-        return  # временные ошибки (SERVFAIL и т.п.) не кэшируем
+        return
     ttl = NEGATIVE_TTL
     if answer:
         ttl = max(1, min(rr.ttl for rr in answer))
@@ -160,9 +127,7 @@ def lookup_cache(key: str):
         return rrsets, entry["rcode"]
 
 
-# ==========================================================================
 #  Итеративное разрешение имён
-# ==========================================================================
 def query_nameservers(qname, qtype, nameservers, timeout=QUERY_TIMEOUT):
     """Опросить по очереди список IP-адресов серверов, вернуть первый ответ."""
     q = dns.message.make_query(qname, qtype)
@@ -170,7 +135,6 @@ def query_nameservers(qname, qtype, nameservers, timeout=QUERY_TIMEOUT):
         try:
             resp = dns.query.udp(q, ip, timeout=timeout)
             if resp.flags & dns.flags.TC:
-                # ответ обрезан - повторяем через TCP
                 resp = dns.query.tcp(q, ip, timeout=timeout)
             return resp
         except (dns.exception.Timeout, OSError, dns.query.BadResponse,
@@ -199,7 +163,6 @@ def iterative_query(qname: dns.name.Name, qtype: int):
             got_requested = any(rr.rdtype == qtype for rr in response.answer)
             if got_requested or qtype == dns.rdatatype.CNAME:
                 return list(response.answer), rcode
-            # возможно, получили CNAME вместо запрошенного типа - идём дальше
             cname_rr = next(
                 (rr for rr in response.answer if rr.rdtype == dns.rdatatype.CNAME),
                 None,
@@ -214,23 +177,19 @@ def iterative_query(qname: dns.name.Name, qtype: int):
             return [], dns.rcode.NXDOMAIN
 
         if not response.authority:
-            return [], rcode  # NODATA
-
+            return [], rcode 
         ns_rrsets = [rr for rr in response.authority if rr.rdtype == dns.rdatatype.NS]
         if not ns_rrsets:
-            # вероятно SOA в authority -> NODATA / конец делегирования
             return [], rcode
 
         ns_names = [rr.target for rrset in ns_rrsets for rr in rrset]
 
-        # ищем glue-записи (A) в additional section
         glue_ips = []
         for rrset in response.additional:
             if rrset.rdtype == dns.rdatatype.A and rrset.name in ns_names:
                 glue_ips.extend(str(rr.address) for rr in rrset)
 
         if not glue_ips:
-            # glue нет - разрешаем A-записи NS-серверов рекурсивно (через кэш/резолв)
             for ns_name in ns_names:
                 try:
                     sub_answer, _ = resolve(ns_name, dns.rdatatype.A)
@@ -270,10 +229,7 @@ def resolve(qname, qtype: int):
     store_cache(key, answer, rcode)
     return answer, rcode
 
-
-# ==========================================================================
 #  Обработка DNS-запросов (построение ответа)
-# ==========================================================================
 def build_response(request: dns.message.Message, client_ip: str) -> dns.message.Message:
     response = dns.message.make_response(request)
     response.flags |= dns.flags.RA  # recursion available
@@ -301,9 +257,7 @@ def build_response(request: dns.message.Message, client_ip: str) -> dns.message.
     return response
 
 
-# ==========================================================================
 #  Сетевые обработчики (UDP + TCP), многопоточный сервер
-# ==========================================================================
 class DNSHandlerUDP(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
@@ -356,9 +310,7 @@ class ThreadingTCPDNSServer(socketserver.ThreadingMixIn, socketserver.TCPServer)
     daemon_threads = True
 
 
-# ==========================================================================
 #  Терминальный интерфейс
-# ==========================================================================
 def print_help():
     print("""
 Доступные команды:
@@ -420,9 +372,7 @@ def terminal_loop(udp_server, tcp_server):
             print("Неизвестная команда. Наберите 'help' для справки.")
 
 
-# ==========================================================================
 #  main
-# ==========================================================================
 def main():
     global CACHE_FILE
 
