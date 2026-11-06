@@ -1,422 +1,172 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import argparse
-import json
-import os
 import socket
-import socketserver
 import struct
-import sys
 import threading
-import time
 
-import dns.flags
-import dns.message
-import dns.name
-import dns.query
-import dns.rcode
-import dns.rdataclass
-import dns.rdatatype
-import dns.rrset
-import dns.exception
+#корневой днс сервер
+ROOT = ['198.41.0.4']
 
-ROOT_SERVERS = [
-    "198.41.0.4",     # a.root-servers.net
-    "199.9.14.201",   # b.root-servers.net
-    "192.33.4.12",    # c.root-servers.net
-    "199.7.91.13",    # d.root-servers.net
-    "192.203.230.10", # e.root-servers.net
-    "192.5.5.241",    # f.root-servers.net
-    "192.112.36.4",   # g.root-servers.net
-    "198.97.190.53",  # h.root-servers.net
-    "192.36.148.17",  # i.root-servers.net
-    "192.58.128.30",  # j.root-servers.net
-    "193.0.14.129",   # k.root-servers.net
-    "199.7.83.42",    # l.root-servers.net
-    "202.12.27.33",   # m.root-servers.net
-]
-
-QUERY_TIMEOUT = 3.0      # таймаут одного UDP/TCP запроса к серверу, сек
-MAX_HOPS = 20            # максимум шагов делегирования в итеративном резолве
-NEGATIVE_TTL = 300       # TTL для кэширования отрицательных ответов (NXDOMAIN)
-
-CACHE_FILE = "dns_cache.json"
-cache_lock = threading.Lock()
-cache = {} 
-
-#  Кэш: загрузка, сохранение, сериализация
-def load_cache():
-    global cache
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            now = time.time()
-            cache = {k: v for k, v in data.items() if v.get("expire", 0) > now}
-            print(f"[cache] загружено {len(cache)} актуальных записей из {CACHE_FILE}")
-        except Exception as e:
-            print(f"[cache] не удалось загрузить кэш ({e}), начинаем с пустого")
-            cache = {}
-    else:
-        cache = {}
-
-
-
-def save_cache():
-    with cache_lock:
-        try:
-            tmp_file = CACHE_FILE + ".tmp"
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(cache, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_file, CACHE_FILE)
-        except Exception as e:
-            print(f"[cache] ошибка сохранения кэша: {e}")
-
-
-def cache_key(qname: dns.name.Name, qtype: int) -> str:
-    return f"{qname.to_text().lower()}|{dns.rdatatype.to_text(qtype)}"
-
-
-def serialize_rrset(rrset) -> dict:
-    return {
-        "name": rrset.name.to_text(),
-        "ttl": rrset.ttl,
-        "rdclass": dns.rdataclass.to_text(rrset.rdclass),
-        "rdtype": dns.rdatatype.to_text(rrset.rdtype),
-        "rdata": [rd.to_text() for rd in rrset],
-    }
-
-
-def deserialize_rrset(d: dict, ttl: int):
-    if not d["rdata"]:
-        return None
-    return dns.rrset.from_text(d["name"], ttl, d["rdclass"], d["rdtype"], *d["rdata"])
-
-
-def store_cache(key: str, answer, rcode: int):
-    if rcode not in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
-        return
-    ttl = NEGATIVE_TTL
-    if answer:
-        ttl = max(1, min(rr.ttl for rr in answer))
-    with cache_lock:
-        cache[key] = {
-            "rrsets": [serialize_rrset(rr) for rr in answer],
-            "rcode": int(rcode),
-            "expire": time.time() + ttl,
-        }
-    threading.Thread(target=save_cache, daemon=True).start()
-
-
-def lookup_cache(key: str):
-    with cache_lock:
-        entry = cache.get(key)
-        if not entry:
+#Вспомогательная функция для чтением N байт по TCP
+def recvall(sock, n):
+    data = b''
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
             return None
-        remaining = entry["expire"] - time.time()
-        if remaining <= 0:
-            del cache[key]
-            return None
-        rrsets = []
-        ttl = max(1, int(remaining))
-        for d in entry["rrsets"]:
-            rr = deserialize_rrset(d, ttl)
-            if rr is not None:
-                rrsets.append(rr)
-        return rrsets, entry["rcode"]
+        data += packet
+    return data
+
+#Превращает домен в байты DNS-формата
+def encode_domain(name):
+    parts = name.encode().split(b'.')
+    result = b''
+    for p in parts:
+        if p:
+            result += len(p).to_bytes(1) + p
+    return result + b'\x00'
 
 
-#  Итеративное разрешение имён
-def query_nameservers(qname, qtype, nameservers, timeout=QUERY_TIMEOUT):
-    """Опросить по очереди список IP-адресов серверов, вернуть первый ответ."""
-    q = dns.message.make_query(qname, qtype)
-    for ip in nameservers:
-        try:
-            resp = dns.query.udp(q, ip, timeout=timeout)
-            if resp.flags & dns.flags.TC:
-                resp = dns.query.tcp(q, ip, timeout=timeout)
-            return resp
-        except (dns.exception.Timeout, OSError, dns.query.BadResponse,
-                dns.exception.FormError, ConnectionError):
+#Декодирует домен из байт
+def decode_domain(data, offset):
+    parts, orig = [], None
+    while offset < len(data):
+        length = data[offset]
+        if length == 0:
+            return '.'.join(parts), (orig or offset + 1)
+        if (length & 0xC0) == 0xC0:
+            ptr = struct.unpack('!H', data[offset: offset + 2])[0] & 0x3FFF
+            orig = orig or offset + 2
+            offset = ptr
             continue
-        except Exception:
-            continue
-    return None
+        offset += 1
+        parts.append(data[offset: offset + length].decode('utf-8', 'ignore'))
+        offset += length
+    return '.'.join(parts), orig or offset
 
+#Разбирает ответный DNS-пакет от внешнего сервера
+def parse_response(resp):
+    if len(resp) < 12:
+        return b'', 0, [], {}, 2
+    flags = struct.unpack('!H', resp[2:4])[0]
+    rcode = flags & 0x000F
+    _, _, qd, an, ns, ar = struct.unpack('!HHHHHH', resp[:12])
+    offset = 12
+    for _ in range(qd):
+        _, offset = decode_domain(resp, offset)
+        offset += 4
 
-def iterative_query(qname: dns.name.Name, qtype: int):
-    """Собственно итеративное разрешение имени: начинаем с корневых
-    серверов и следуем за делегированием (referral) до получения
-    окончательного ответа."""
-    nameservers = list(ROOT_SERVERS)
-    visited = set()
+    ans_start = offset
+    for _ in range(an):
+        _, offset = decode_domain(resp, offset)
+        offset += 10 + struct.unpack('!H', resp[offset + 8: offset + 10])[0]
+    ans_end = offset
 
-    for _ in range(MAX_HOPS):
-        response = query_nameservers(qname, qtype, nameservers)
-        if response is None:
-            return [], dns.rcode.SERVFAIL
+    ns_recs = []
+    for _ in range(ns):
+        _, offset = decode_domain(resp, offset)
+        rtype, _, _, rdlen = struct.unpack('!HHIH', resp[offset: offset + 10])
+        offset += 10
+        if rtype == 2:
+            ns_recs.append(decode_domain(resp, offset)[0])
+        offset += rdlen
 
-        rcode = response.rcode()
+    glue = {}
+    for _ in range(ar):
+        name, offset = decode_domain(resp, offset)
+        rtype, _, _, rdlen = struct.unpack('!HHIH', resp[offset: offset + 10])
+        offset += 10
+        if rtype == 1 and rdlen == 4:
+            glue[name.lower()] = socket.inet_ntoa(resp[offset: offset + 4])
+        offset += rdlen
 
-        if response.answer:
-            got_requested = any(rr.rdtype == qtype for rr in response.answer)
-            if got_requested or qtype == dns.rdatatype.CNAME:
-                return list(response.answer), rcode
-            cname_rr = next(
-                (rr for rr in response.answer if rr.rdtype == dns.rdatatype.CNAME),
-                None,
-            )
-            if cname_rr is not None:
-                target = cname_rr[0].target
-                sub_answer, sub_rcode = resolve(target, qtype)
-                return list(response.answer) + list(sub_answer), sub_rcode
-            return list(response.answer), rcode
+    return resp[ans_start:ans_end], an, ns_recs, glue, rcode
 
-        if rcode == dns.rcode.NXDOMAIN:
-            return [], dns.rcode.NXDOMAIN
+#Итеративный поиск
+def resolve(query):
+    qname, offset = decode_domain(query, 12)
+    qtype, qclass = struct.unpack('!HH', query[offset: offset + 4])
 
-        if not response.authority:
-            return [], rcode 
-        ns_rrsets = [rr for rr in response.authority if rr.rdtype == dns.rdatatype.NS]
-        if not ns_rrsets:
-            return [], rcode
-
-        ns_names = [rr.target for rrset in ns_rrsets for rr in rrset]
-
-        glue_ips = []
-        for rrset in response.additional:
-            if rrset.rdtype == dns.rdatatype.A and rrset.name in ns_names:
-                glue_ips.extend(str(rr.address) for rr in rrset)
-
-        if not glue_ips:
-            for ns_name in ns_names:
-                try:
-                    sub_answer, _ = resolve(ns_name, dns.rdatatype.A)
-                    for rrset in sub_answer:
-                        if rrset.rdtype == dns.rdatatype.A:
-                            glue_ips.extend(str(rr.address) for rr in rrset)
-                except Exception:
-                    continue
-                if glue_ips:
-                    break
-
-        if not glue_ips:
-            return [], dns.rcode.SERVFAIL
-
-        key = tuple(sorted(glue_ips))
-        if key in visited:
-            return [], dns.rcode.SERVFAIL
-        visited.add(key)
-        nameservers = glue_ips
-
-    return [], dns.rcode.SERVFAIL
-
-
-def resolve(qname, qtype: int):
-    """Обёртка с кэшем. Принимает dns.name.Name либо строку."""
-    if isinstance(qname, str):
-        qname = dns.name.from_text(qname)
-    if not qname.is_absolute():
-        qname = qname.concatenate(dns.name.root)
-
-    key = cache_key(qname, qtype)
-    hit = lookup_cache(key)
-    if hit is not None:
-        return hit
-
-    answer, rcode = iterative_query(qname, qtype)
-    store_cache(key, answer, rcode)
-    return answer, rcode
-
-#  Обработка DNS-запросов (построение ответа)
-def build_response(request: dns.message.Message, client_ip: str) -> dns.message.Message:
-    response = dns.message.make_response(request)
-    response.flags |= dns.flags.RA  # recursion available
-
-    if not request.question:
-        response.set_rcode(dns.rcode.FORMERR)
-        return response
-
-    q = request.question[0]
-    qname = q.name
-    qtype = q.rdtype
-
-    print(f"[{time.strftime('%H:%M:%S')}] {client_ip:<15} -> "
-          f"{qname.to_text():<40} {dns.rdatatype.to_text(qtype)}")
-
-    try:
-        answer, rcode = resolve(qname, qtype)
-        for rrset in answer:
-            response.answer.append(rrset)
-        response.set_rcode(rcode)
-    except Exception as e:
-        print(f"[ошибка] {e}")
-        response.set_rcode(dns.rcode.SERVFAIL)
-
-    return response
-
-
-#  Сетевые обработчики (UDP + TCP), многопоточный сервер
-class DNSHandlerUDP(socketserver.BaseRequestHandler):
-    def handle(self):
-        data, sock = self.request
-        client_ip = self.client_address[0]
-        try:
-            request = dns.message.from_wire(data)
-        except Exception:
-            return
-        response = build_response(request, client_ip)
-        try:
-            sock.sendto(response.to_wire(), self.client_address)
-        except Exception:
-            pass
-
-
-class ThreadingUDPDNSServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-class DNSHandlerTCP(socketserver.BaseRequestHandler):
-    def handle(self):
-        try:
-            length_data = self._recv_exact(2)
-            if length_data is None:
-                return
-            (length,) = struct.unpack("!H", length_data)
-            data = self._recv_exact(length)
-            if data is None:
-                return
-            request = dns.message.from_wire(data)
-            response = build_response(request, self.client_address[0])
-            wire = response.to_wire()
-            self.request.sendall(struct.pack("!H", len(wire)) + wire)
-        except Exception:
-            pass
-
-    def _recv_exact(self, n):
-        buf = b""
-        while len(buf) < n:
-            chunk = self.request.recv(n - len(buf))
-            if not chunk:
-                return None
-            buf += chunk
-        return buf
-
-
-class ThreadingTCPDNSServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-#  Терминальный интерфейс
-def print_help():
-    print("""
-Доступные команды:
-  cache        - показать содержимое кэша
-  clear        - очистить кэш (в памяти и на диске)
-  save         - принудительно сохранить кэш на диск
-  stats        - показать количество записей в кэше
-  help         - показать эту справку
-  exit / quit  - остановить сервер и выйти
-""")
-
-
-def print_cache():
-    with cache_lock:
-        if not cache:
-            print("Кэш пуст")
-            return
-        now = time.time()
-        print(f"{'ИМЯ':<40} {'ТИП':<8} {'TTL':<6} ЗНАЧЕНИЯ")
-        for key, entry in cache.items():
-            name, qtype = key.split("|")
-            ttl = max(0, int(entry["expire"] - now))
-            if entry["rcode"] == dns.rcode.NXDOMAIN:
-                print(f"{name:<40} {qtype:<8} {ttl:<6} NXDOMAIN")
+    servers = ROOT
+    for _ in range(5):
+        next_s = []
+        for ip in servers:
+            try:
+                packet = struct.pack('!HHHHHH', 0x1234, 0x0000, 1, 0, 0, 0) + encode_domain(qname) + struct.pack('!HH',
+                                                                                                                 qtype,
+                                                                                                                 qclass)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.settimeout(2)
+                    s.sendto(packet, (ip, 53))
+                    resp, _ = s.recvfrom(512)
+                ans, an_count, ns_recs, glue, rcode = parse_response(resp)
+                if an_count > 0 or rcode != 0:
+                    return ans, an_count, rcode
+                next_s.extend(glue[n.lower()] for n in ns_recs if n.lower() in glue)
+            except:
                 continue
-            values = []
-            for rr in entry["rrsets"]:
-                values.extend(rr["rdata"])
-            print(f"{name:<40} {qtype:<8} {ttl:<6} {', '.join(values) if values else '(нет данных)'}")
-
-
-def terminal_loop(udp_server, tcp_server):
-    print_help()
-    while True:
-        try:
-            cmd = input("dns> ").strip()
-        except EOFError:
+        if not next_s:
             break
-        if cmd in ("exit", "quit"):
-            break
-        elif cmd == "help":
-            print_help()
-        elif cmd == "cache":
-            print_cache()
-        elif cmd == "clear":
-            with cache_lock:
-                cache.clear()
-            save_cache()
-            print("Кэш очищен")
-        elif cmd == "save":
-            save_cache()
-            print("Кэш сохранён на диск")
-        elif cmd == "stats":
-            with cache_lock:
-                print(f"Записей в кэше: {len(cache)}")
-        elif cmd == "":
-            continue
-        else:
-            print("Неизвестная команда. Наберите 'help' для справки.")
+        servers = next_s
+    return None, 0, 2
 
+#Формирует DNS-ответ для клиента
+def process_query(data):
+    tx_id = struct.unpack('!H', data[:2])[0]
 
-#  main
-def main():
-    global CACHE_FILE
+    request_flags = struct.unpack('!H', data[2:4])[0]
 
-    parser = argparse.ArgumentParser(description="Итеративный DNS-сервер на Python")
-    parser.add_argument("--host", default="0.0.0.0", help="адрес для прослушивания (по умолчанию 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=53, help="порт (по умолчанию 53, требует прав администратора)")
-    parser.add_argument("--cache-file", default=CACHE_FILE, help="файл для хранения кэша между перезапусками")
-    args = parser.parse_args()
+    qname, offset = decode_domain(data, 12)
+    ans, an_count, rcode = resolve(data)
+    flags = (request_flags & 0x7FF0) | 0x8000 | rcode
+    
+    if an_count == 0:
+        return struct.pack('!HHHHHH', tx_id, flags, 1, 0, 0, 0) + data[12:offset + 4]
+    return struct.pack('!HHHHHH', tx_id, flags, 1, an_count, 0, 0) + data[12:offset + 4] + ans
 
-    CACHE_FILE = args.cache_file
-    load_cache()
-
+#Обработка одного клиента по TCP
+def handle_tcp(conn):
     try:
-        udp_server = ThreadingUDPDNSServer((args.host, args.port), DNSHandlerUDP)
-        tcp_server = ThreadingTCPDNSServer((args.host, args.port), DNSHandlerTCP)
-    except PermissionError:
-        print(f"Нет прав на привязку к порту {args.port}.")
-        print("Запустите с правами администратора/root, либо укажите другой порт: --port 5353")
-        sys.exit(1)
-    except OSError as e:
-        print(f"Не удалось запустить сервер на {args.host}:{args.port} - {e}")
-        sys.exit(1)
-
-    threading.Thread(target=udp_server.serve_forever, daemon=True).start()
-    threading.Thread(target=tcp_server.serve_forever, daemon=True).start()
-
-    print("=" * 70)
-    print(f"Итеративный DNS-сервер запущен на {args.host}:{args.port} (UDP и TCP)")
-    print(f"Файл кэша: {os.path.abspath(CACHE_FILE)}")
-    print("=" * 70)
-
-    try:
-        terminal_loop(udp_server, tcp_server)
-    except KeyboardInterrupt:
+        length_bytes = recvall(conn, 2)
+        if length_bytes:
+            length = struct.unpack('!H', length_bytes)[0]
+            data = recvall(conn, length)
+            if data:
+                resp = process_query(data)
+                conn.sendall(struct.pack('!H', len(resp)) + resp)
+    except:
         pass
     finally:
-        print("\nЗавершение работы, сохранение кэша...")
-        save_cache()
-        udp_server.shutdown()
-        tcp_server.shutdown()
-        udp_server.server_close()
-        tcp_server.server_close()
-        print("Сервер остановлен. До свидания!")
+        conn.close()
 
 
-if __name__ == "__main__":
-    main()
+#Обработка одного клиента по UDP
+def handle_udp(udp, data, addr):
+    try:
+        response = process_query(data)
+        udp.sendto(response, addr)
+    except:
+        pass
+
+#Запуск udp сервера
+def run_udp():
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(('127.0.0.1', 1053))
+    while True:
+        data, addr = udp.recvfrom(512)
+        threading.Thread(target=handle_udp, args=(udp, data, addr), daemon=True).start()
+
+#Запуск tcp сервера
+def run_tcp():
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.bind(('127.0.0.1', 1053))
+    tcp.listen(5)
+    while True:
+        conn, _ = tcp.accept()
+        threading.Thread(target=handle_tcp, args=(conn,)).start()
+
+
+if __name__ == '__main__':
+    threading.Thread(target=run_udp, daemon=True).start()
+    threading.Thread(target=run_tcp, daemon=True).start()
+
+    print('DNS running on 127.0.0.1:1053')
+    threading.Event().wait()
