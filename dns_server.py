@@ -30,8 +30,10 @@ def decode_domain(data, offset):
     parts, orig = [], None
     while offset < len(data):
         length = data[offset]
+
         if length == 0:
             return '.'.join(parts), (orig or offset + 1)
+        
         if (length & 0xC0) == 0xC0:
             ptr = struct.unpack('!H', data[offset: offset + 2])[0] & 0x3FFF
             orig = orig or offset + 2
@@ -90,9 +92,11 @@ def resolve(query):
         next_s = []
         for ip in servers:
             try:
-                packet = struct.pack('!HHHHHH', 0x1234, 0x0000, 1, 0, 0, 0) + encode_domain(qname) + struct.pack('!HH',
-                                                                                                                 qtype,
-                                                                                                                 qclass)
+                packet = (
+                    struct.pack('!HHHHHH', 0x1234, 0x0000, 1, 0, 0, 0) 
+                    + encode_domain(qname) + struct.pack('!HH', qtype, qclass)
+                )
+
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                     s.settimeout(2)
                     s.sendto(packet, (ip, 53))
@@ -119,8 +123,16 @@ def process_query(data):
     flags = (request_flags & 0x7FF0) | 0x8000 | rcode
     
     if an_count == 0:
-        return struct.pack('!HHHHHH', tx_id, flags, 1, 0, 0, 0) + data[12:offset + 4]
-    return struct.pack('!HHHHHH', tx_id, flags, 1, an_count, 0, 0) + data[12:offset + 4] + ans
+        return (
+            struct.pack('!HHHHHH', tx_id, flags, 1, 0, 0, 0) 
+            + data[12:offset + 4]
+        )
+    
+    return (
+        struct.pack('!HHHHHH', tx_id, flags, 1, an_count, 0, 0) 
+        + data[12:offset + 4] 
+        + ans
+    )
 
 #Обработка одного клиента по TCP
 def handle_tcp(conn):
